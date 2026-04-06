@@ -90,6 +90,15 @@ struct DynamicIslandView: View {
         }
         .onChange(of: store.sessions.count) { _ in
             updateGlow()
+            if expanded { updateWindowSize(expanded: true) }
+        }
+        .onChange(of: store.sessions.map(\.status.rawValue).joined()) { _ in
+            // Auto-collapse if all sessions are idle and no permission pending
+            if expanded && !hasPermissionPending &&
+               store.sessions.allSatisfy({ $0.status == .idle || $0.status == .working }) {
+                // keep expanded — only collapse on explicit tap
+            }
+            if expanded { updateWindowSize(expanded: true) }
         }
         .onAppear {
             updateGlow()
@@ -174,17 +183,23 @@ struct DynamicIslandView: View {
 
     // MARK: - Session list
 
+    private var sortedSessions: [ClaudeSession] {
+        store.sessions.sorted {
+            if $0.status == .waitingForPermission && $1.status != .waitingForPermission { return true }
+            if $0.status != .waitingForPermission && $1.status == .waitingForPermission { return false }
+            return $0.lastActivityAt > $1.lastActivityAt
+        }
+    }
+
     private var sessionList: some View {
-        VStack(spacing: 6) {
-            let sorted = store.sessions.sorted {
-                if $0.status == .waitingForPermission && $1.status != .waitingForPermission { return true }
-                if $0.status != .waitingForPermission && $1.status == .waitingForPermission { return false }
-                return $0.lastActivityAt > $1.lastActivityAt
-            }
-            ForEach(sorted) { session in
-                SessionCard(session: session, store: store)
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 6) {
+                ForEach(sortedSessions) { session in
+                    SessionCard(session: session, store: store)
+                }
             }
         }
+        .frame(maxHeight: 420)
     }
 
     // MARK: - Empty state
@@ -268,16 +283,17 @@ struct DynamicIslandView: View {
 
     private func updateWindowSize(expanded: Bool) {
         guard let window else { return }
-        let sessionCount = store.sessions.count
-        let expandedHeight: CGFloat = sessionCount == 0
-            ? 160
-            : CGFloat(60 + sessionCount * 110 + (hasPermissionPending ? 80 : 0))
-        let clampedHeight = min(expandedHeight, 520)
-
-        let targetSize = expanded
-            ? CGSize(width: DynamicIslandWindow.expandedWidth, height: clampedHeight)
-            : DynamicIslandWindow.collapsedSize
-
+        let targetSize: CGSize
+        if expanded {
+            let sessionCount = store.sessions.count
+            let baseHeight: CGFloat = 80                            // header + padding
+            let perSession: CGFloat = hasPermissionPending ? 165 : 110
+            let estimated = baseHeight + CGFloat(max(sessionCount, 1)) * perSession
+            let clampedHeight = min(estimated, 500)
+            targetSize = CGSize(width: DynamicIslandWindow.expandedWidth, height: clampedHeight)
+        } else {
+            targetSize = DynamicIslandWindow.collapsedSize
+        }
         window.resize(to: targetSize, animated: true)
     }
 
