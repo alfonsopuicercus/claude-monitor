@@ -1,14 +1,21 @@
 // DynamicIslandWindow.swift
-// A borderless NSPanel that hugs the very top of the primary screen — exactly
-// like the iPhone Dynamic Island: square top corners, rounded bottom corners,
-// always above other windows.
+// A borderless NSPanel that hugs the very top of the chosen screen.
 
 import AppKit
 import SwiftUI
 
+extension Notification.Name {
+    static let pinnedScreenChanged = Notification.Name("ClaudeMonitorPinnedScreenChanged")
+}
+
+/// Ensures the first mouse-down activates buttons rather than just making the panel key.
+final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 final class DynamicIslandWindow: NSPanel {
 
-    static let barHeight: CGFloat   = 42     // collapsed bar height
+    static let barHeight: CGFloat    = 42
     static let expandedWidth: CGFloat = 420
     static var collapsedSize: CGSize { CGSize(width: 310, height: barHeight) }
 
@@ -26,13 +33,21 @@ final class DynamicIslandWindow: NSPanel {
         level           = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)))
         backgroundColor = .clear
         isOpaque        = false
-        hasShadow       = false   // shadow drawn by SwiftUI
+        hasShadow       = false
         isMovableByWindowBackground = false
         collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         acceptsMouseMovedEvents = true
 
+        // Seed the pinned screen default to the primary display if not yet set
+        if UserDefaults.standard.string(forKey: "claudeMonitor.pinnedScreen") == nil {
+            UserDefaults.standard.set(
+                NSScreen.screens.first?.localizedName ?? "",
+                forKey: "claudeMonitor.pinnedScreen"
+            )
+        }
+
         let view = DynamicIslandView(store: store, window: self)
-        let hv   = NSHostingView(rootView: view)
+        let hv   = FirstMouseHostingView(rootView: view)
         hv.autoresizingMask = [.width, .height]
         contentView = hv
 
@@ -41,6 +56,10 @@ final class DynamicIslandWindow: NSPanel {
         NotificationCenter.default.addObserver(
             self, selector: #selector(screenChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(screenChanged),
+            name: .pinnedScreenChanged, object: nil
         )
     }
 
@@ -52,12 +71,19 @@ final class DynamicIslandWindow: NSPanel {
 
     // MARK: - Private helpers
 
+    /// The screen to pin to: the stored preference, falling back to the primary display.
+    private var preferredScreen: NSScreen {
+        let stored = UserDefaults.standard.string(forKey: "claudeMonitor.pinnedScreen") ?? ""
+        return NSScreen.screens.first(where: { $0.localizedName == stored })
+            ?? NSScreen.screens.first
+            ?? NSScreen.main
+            ?? NSScreen.screens[0]
+    }
+
     private func snapToTop(size: CGSize, animated: Bool) {
-        guard let screen = NSScreen.main else { return }
-        let sr = screen.frame
-        // Pin to the very top center — y puts the TOP of the window at screen.maxY
+        let sr = preferredScreen.frame
         let x = (sr.width - size.width) / 2 + sr.minX
-        let y = sr.maxY - size.height       // flush to top
+        let y = sr.maxY - size.height
         let newFrame = NSRect(x: x, y: y, width: size.width, height: size.height)
 
         if animated {

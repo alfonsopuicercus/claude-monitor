@@ -4,6 +4,7 @@
 
 import Foundation
 import AppKit
+import AVFoundation
 
 // MARK: - Notification names
 
@@ -82,6 +83,13 @@ final class SessionStore: ObservableObject {
     private let acceptQueue = DispatchQueue(label: "com.claude-monitor.accept", qos: .background)
     private let clientQueue = DispatchQueue(label: "com.claude-monitor.clients",
                                             qos: .background, attributes: .concurrent)
+
+    // MARK: Sound
+
+    private func playSound(_ name: NSSound.Name) {
+        guard UserDefaults.standard.bool(forKey: "claudeMonitor.soundEnabled") != false else { return }
+        NSSound(named: name)?.play()
+    }
 
     // MARK: Init
 
@@ -198,7 +206,7 @@ final class SessionStore: ObservableObject {
             if let data = try? JSONSerialization.data(withJSONObject: resp) {
                 var payload = data
                 payload.append(contentsOf: [UInt8]("\n".utf8))
-                _ = payload.withUnsafeBytes { send(fd, $0.baseAddress!, $0.count, 0) }
+                payload.withUnsafeBytes { send(fd, $0.baseAddress!, $0.count, 0) }
             }
             close(fd)
             pendingPermissionFDs.removeValue(forKey: sessionId)
@@ -302,6 +310,18 @@ final class SessionStore: ObservableObject {
                 default:
                     break
                 }
+            }
+
+            // Sound notifications
+            switch hookEvent {
+            case "PermissionRequest":
+                self.playSound(.init("Funk"))          // urgent ping for approval needed
+            case "SessionStart":
+                self.playSound(.init("Tink"))          // subtle chime for new session
+            case "Stop":
+                self.playSound(.init("Glass"))         // soft chime when task completes
+            default:
+                break
             }
 
             // Hold the fd open for permission requests so we can send the response later

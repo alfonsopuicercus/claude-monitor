@@ -20,6 +20,10 @@ struct DynamicIslandView: View {
     @State private var glowOpacity: Double = 0
     @State private var glowScale: CGFloat = 1.0
 
+    // Status cycling
+    @State private var statusPhase: Int = 0
+    private let statusTimer = Timer.publish(every: 2.4, on: .main, in: .common).autoconnect()
+
     var hasPermission: Bool { store.totalPermissionsWaiting > 0 }
     var isWorking: Bool    { store.sessions.contains { $0.status == .working } }
 
@@ -54,7 +58,7 @@ struct DynamicIslandView: View {
                         .scaleEffect(glowScale)
                         .opacity(glowOpacity)
 
-                    NotchShape().fill(Color(white: 0.07))
+                    NotchShape().fill(Color(white: 0.02))
 
                     NotchShape()
                         .stroke(
@@ -123,27 +127,28 @@ struct DynamicIslandView: View {
                 if hasPermission {
                     HStack(spacing: 5) {
                         Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 11))
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
                             .foregroundColor(.orange)
-                        Text(permissionLabel)
-                            .font(.system(size: 12, weight: .semibold))
+                        Text(permissionLabel.uppercased())
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .foregroundColor(.orange)
                     }
                 } else if isWorking {
-                    HStack(spacing: 6) {
-                        Text("Working")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.white.opacity(0.85))
-                        if let tool = activeTool { MiniToolBadge(name: tool) }
-                    }
+                    CyclingStatusLabel(
+                        tool: activeTool,
+                        toolPreview: activeToolPreview,
+                        lastMessage: workingSession?.lastUserMessage,
+                        phase: statusPhase
+                    )
                 } else if !store.sessions.isEmpty {
-                    Text("\(store.sessions.count) session\(store.sessions.count == 1 ? "" : "s") idle")
-                        .font(.system(size: 12))
-                        .foregroundColor(.white.opacity(0.38))
+                    Text("\(store.sessions.count) IDLE")
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.32))
                 } else {
-                    Text("Claude Monitor")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white.opacity(0.28))
+                    Text("CLAUDE MONITOR")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .tracking(1.5)
+                        .foregroundColor(.white.opacity(0.22))
                 }
             }
             .lineLimit(1)
@@ -151,21 +156,23 @@ struct DynamicIslandView: View {
             Spacer(minLength: 0)
 
             if store.sessions.count > 0 {
-                Text("\(store.sessions.count)")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.25))
+                Text("×\(store.sessions.count)")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.22))
             }
             Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                .font(.system(size: 9, weight: .medium))
-                .foregroundColor(.white.opacity(0.22))
+                .font(.system(size: 8, weight: .bold))
+                .foregroundColor(.white.opacity(0.18))
         }
         .padding(.horizontal, 14)
-        // Click to toggle collapse (hover handles expand)
         .onTapGesture {
             collapseTimer?.invalidate()
             collapseTimer = nil
             withAnimation(.spring(response: 0.40, dampingFraction: 0.74)) { expanded.toggle() }
             updateWindowSize(expanded: expanded)
+        }
+        .onReceive(statusTimer) { _ in
+            if isWorking { statusPhase = (statusPhase + 1) % 3 }
         }
     }
 
@@ -188,6 +195,10 @@ struct DynamicIslandView: View {
                 }
                 .frame(maxHeight: 400)
             }
+
+            Divider().background(Color.white.opacity(0.06))
+
+            TokenStatsView()
 
             Divider().background(Color.white.opacity(0.06))
 
@@ -215,9 +226,10 @@ struct DynamicIslandView: View {
                 .frame(width: 56, height: 44)
                 .scaleEffect(2.0)
                 .frame(width: 112, height: 88)
-            Text("No sessions running")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(.white.opacity(0.28))
+            Text("NO SESSIONS")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .tracking(2)
+                .foregroundColor(.white.opacity(0.22))
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 24)
@@ -234,6 +246,23 @@ struct DynamicIslandView: View {
     }
 
     private var activeTool: String? { store.sessions.first { $0.currentTool != nil }?.currentTool }
+
+    private var workingSession: ClaudeSession? {
+        store.sessions.first { $0.status == .working }
+    }
+
+    private var activeToolPreview: String? {
+        guard let session = store.sessions.first(where: { $0.currentTool != nil }),
+              let input = session.lastToolInput,
+              let data = input.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        // Pick the most meaningful field
+        let val = (obj["command"] ?? obj["file_path"] ?? obj["query"] ?? obj["pattern"] ?? obj["url"] ?? obj.values.first) as? String ?? ""
+        let firstLine = val.components(separatedBy: .newlines).first ?? val
+        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.count > 40 ? String(trimmed.prefix(40)) + "…" : trimmed
+    }
 
     private var permissionLabel: String {
         let n = store.totalPermissionsWaiting
@@ -269,6 +298,45 @@ struct DynamicIslandView: View {
         let content: CGFloat = store.sessions.isEmpty ? 110 : CGFloat(store.sessions.count) * 118 + (hasPermission ? 80 : 0)
         let h = min(base + content, 560)
         window.resize(to: CGSize(width: DynamicIslandWindow.expandedWidth, height: h), animated: true)
+    }
+}
+
+// MARK: - Cycling status label (collapsed bar while working)
+
+struct CyclingStatusLabel: View {
+    let tool: String?
+    let toolPreview: String?
+    let lastMessage: String?
+    let phase: Int
+
+    // Phases: 0 = WORKING, 1 = tool+preview, 2 = last prompt
+    private var slots: [(text: String, color: Color)] {
+        var result: [(String, Color)] = []
+        result.append(("WORKING...", Color.white.opacity(0.7)))
+        if let t = tool {
+            let preview = toolPreview.map { " \($0)" } ?? ""
+            result.append((t.uppercased() + preview, MiniToolBadge.toolColor(t)))
+        } else {
+            result.append(("THINKING...", Color.white.opacity(0.45)))
+        }
+        if let msg = lastMessage, !msg.isEmpty {
+            let abbrev = msg.count > 38 ? String(msg.prefix(38)) + "…" : msg
+            result.append((abbrev, Color.white.opacity(0.5)))
+        } else {
+            result.append(("PROCESSING...", Color.white.opacity(0.45)))
+        }
+        return result
+    }
+
+    var body: some View {
+        let idx = phase % slots.count
+        Text(slots[idx].text)
+            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundColor(slots[idx].color)
+            .lineLimit(1)
+            .id(idx)   // force re-render for transition
+            .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            .animation(.easeInOut(duration: 0.35), value: idx)
     }
 }
 
@@ -654,8 +722,12 @@ struct SettingsPanel: View {
     @ObservedObject var store: SessionStore
     var onDone: () -> Void
 
-    @AppStorage("claudeMonitor.autoExpand")    var autoExpand   = true
-    @AppStorage("claudeMonitor.idleTimeout")   var idleTimeout  = 5
+    @AppStorage("claudeMonitor.autoExpand")    var autoExpand    = true
+    @AppStorage("claudeMonitor.idleTimeout")   var idleTimeout   = 5
+    @AppStorage("claudeMonitor.pinnedScreen")  var pinnedScreen  = ""
+    @AppStorage("claudeMonitor.soundEnabled")  var soundEnabled  = true
+
+    private var availableScreens: [NSScreen] { NSScreen.screens }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -670,6 +742,28 @@ struct SettingsPanel: View {
             }
 
             Divider().background(Color.white.opacity(0.1))
+
+            SettingRow(label: "Display",
+                       detail: "Screen where the island appears") {
+                Picker("", selection: $pinnedScreen) {
+                    ForEach(availableScreens, id: \.localizedName) { screen in
+                        Text(screen.localizedName).tag(screen.localizedName)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.7))
+                .frame(maxWidth: 140)
+                .onChange(of: pinnedScreen) { _ in
+                    NotificationCenter.default.post(name: .pinnedScreenChanged, object: nil)
+                }
+            }
+
+            SettingRow(label: "Sound notifications",
+                       detail: "Chimes for new session, approval, task done") {
+                Toggle("", isOn: $soundEnabled).labelsHidden().toggleStyle(.switch)
+            }
 
             SettingRow(label: "Auto-expand on permission",
                        detail: "Expands island when Claude needs approval") {
@@ -715,25 +809,94 @@ struct SettingRow<C: View>: View {
 
 struct MiniToolBadge: View {
     let name: String
-    var color: Color {
+    var color: Color { MiniToolBadge.toolColor(name) }
+
+    static func toolColor(_ name: String) -> Color {
         switch name {
-        case "Bash":                return Color(red: 0.25, green: 0.55, blue: 1.0)
-        case "Edit", "Write":       return Color(red: 0.70, green: 0.35, blue: 1.0)
-        case "Read":                return Color(red: 0.25, green: 0.80, blue: 0.65)
-        case "Grep", "Glob":        return Color(red: 0.20, green: 0.72, blue: 0.75)
-        case "WebSearch","WebFetch": return Color(red: 1.00, green: 0.55, blue: 0.20)
-        case "Subagent":            return Color(red: 0.55, green: 0.45, blue: 1.00)
-        default:                    return Color(white: 0.42)
+        case "Bash":                 return Color(red: 0.25, green: 0.55, blue: 1.0)
+        case "Edit", "Write":        return Color(red: 0.70, green: 0.35, blue: 1.0)
+        case "Read":                 return Color(red: 0.25, green: 0.80, blue: 0.65)
+        case "Grep", "Glob":         return Color(red: 0.20, green: 0.72, blue: 0.75)
+        case "WebSearch", "WebFetch": return Color(red: 1.00, green: 0.55, blue: 0.20)
+        case "Subagent":             return Color(red: 0.55, green: 0.45, blue: 1.00)
+        default:                     return Color(white: 0.42)
         }
     }
+
     var body: some View {
-        Text(name)
-            .font(.system(size: 9, weight: .semibold))
+        Text(name.uppercased())
+            .font(.system(size: 8, weight: .bold, design: .monospaced))
             .foregroundColor(color)
             .padding(.horizontal, 5).padding(.vertical, 2)
             .background(color.opacity(0.13))
             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(color.opacity(0.32), lineWidth: 0.5))
             .cornerRadius(4)
+    }
+}
+
+// MARK: - Token usage
+
+private struct DailyTokenEntry: Codable {
+    var date: String
+    var tokensByModel: [String: Int]
+}
+private struct StatsCache: Codable {
+    var dailyModelTokens: [DailyTokenEntry]?
+}
+
+struct TokenStatsView: View {
+    @State private var todayTokens: Int = 0
+    @State private var weekTokens: Int  = 0
+
+    var body: some View {
+        HStack(spacing: 16) {
+            tokenPill(label: "TODAY", value: todayTokens)
+            tokenPill(label: "30 DAYS", value: weekTokens)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .onAppear { reload() }
+    }
+
+    private func tokenPill(label: String, value: Int) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label)
+                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .tracking(1)
+                .foregroundColor(.white.opacity(0.28))
+            Text(formatTokens(value))
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundColor(.white.opacity(value > 0 ? 0.8 : 0.18))
+        }
+    }
+
+    private func formatTokens(_ n: Int) -> String {
+        if n == 0 { return "—" }
+        if n < 1_000 { return "\(n)" }
+        if n < 1_000_000 { return String(format: "%.1fk", Double(n) / 1_000) }
+        return String(format: "%.2fM", Double(n) / 1_000_000)
+    }
+
+    private func reload() {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/stats-cache.json")
+        guard let data = try? Data(contentsOf: path),
+              let cache = try? JSONDecoder().decode(StatsCache.self, from: data),
+              let entries = cache.dailyModelTokens else { return }
+
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"; fmt.locale = Locale(identifier: "en_US_POSIX")
+        let today = fmt.string(from: Date())
+        let thirtyDaysAgo = fmt.string(from: Date().addingTimeInterval(-29 * 86400))
+
+        var tTotal = 0; var wTotal = 0
+        for entry in entries {
+            let sum = entry.tokensByModel.values.reduce(0, +)
+            if entry.date == today { tTotal += sum }
+            if entry.date >= thirtyDaysAgo { wTotal += sum }
+        }
+        todayTokens = tTotal
+        weekTokens  = wTotal
     }
 }
 
