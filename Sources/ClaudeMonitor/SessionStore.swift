@@ -99,7 +99,16 @@ final class SessionStore: ObservableObject {
     private func loadFromDisk() {
         guard let data = try? Data(contentsOf: kStoragePath),
               let decoded = try? JSONDecoder().decode([ClaudeSession].self, from: data) else { return }
-        sessions = decoded
+        // Any session that was waiting for permission in a previous run cannot be
+        // responded to — the bridge process is gone. Clear those to idle.
+        sessions = decoded.map { s in
+            var s = s
+            if s.status == .waitingForPermission {
+                s.status = .idle
+                s.pendingPermission = nil
+            }
+            return s
+        }
         recalcPermissions()
     }
 
@@ -147,9 +156,16 @@ final class SessionStore: ObservableObject {
     }
 
     private func pruneDeadSessions() {
-        let cutoff = Date().addingTimeInterval(-300)
+        let idleCutoff = Date().addingTimeInterval(-300)         // 5 min idle → remove
+        let permCutoff = Date().addingTimeInterval(-3600)        // 1 h stale permission → remove
         sessions.removeAll {
-            $0.status == .idle && $0.lastActivityAt < cutoff && $0.pendingPermission == nil
+            if $0.status == .idle && $0.lastActivityAt < idleCutoff { return true }
+            // Stale permission request with no live bridge fd → remove
+            if $0.status == .waitingForPermission,
+               let receivedAt = $0.pendingPermission?.receivedAt,
+               receivedAt < permCutoff,
+               pendingPermissionFDs[$0.id] == nil { return true }
+            return false
         }
         recalcPermissions()
         saveToDisk()
@@ -167,19 +183,22 @@ final class SessionStore: ObservableObject {
     }
 
     private func sendPermissionResponse(sessionId: String, allow: Bool) {
-        guard let fd = pendingPermissionFDs[sessionId] else { return }
-        let resp: [String: Any] = allow
-            ? ["continue": true]
-            : ["continue": false, "reason": "Denied via Claude Monitor"]
-        if let data = try? JSONSerialization.data(withJSONObject: resp) {
-            var payload = data
-            payload.append(contentsOf: [UInt8]("\n".utf8))
-            _ = payload.withUnsafeBytes { send(fd, $0.baseAddress!, $0.count, 0) }
+        // Send to bridge if the connection is still live
+        if let fd = pendingPermissionFDs[sessionId] {
+            let resp: [String: Any] = allow
+                ? ["continue": true]
+                : ["continue": false, "reason": "Denied via Claude Monitor"]
+            if let data = try? JSONSerialization.data(withJSONObject: resp) {
+                var payload = data
+                payload.append(contentsOf: [UInt8]("\n".utf8))
+                _ = payload.withUnsafeBytes { send(fd, $0.baseAddress!, $0.count, 0) }
+            }
+            close(fd)
+            pendingPermissionFDs.removeValue(forKey: sessionId)
         }
-        close(fd)
-        pendingPermissionFDs.removeValue(forKey: sessionId)
+        // Always clear the permission UI, whether or not the bridge is still alive
         upsertSession(id: sessionId) { s in
-            s.status = .working
+            s.status = allow ? .working : .idle
             s.pendingPermission = nil
             s.lastActivityAt = Date()
         }
@@ -188,7 +207,6 @@ final class SessionStore: ObservableObject {
     // MARK: Hook event processing (called on background queue, dispatches to main)
 
     private func processEvent(msg: [String: Any], fd: Int32) {
-        print("[ClaudeMonitor] processEvent called: hookEvent=\(msg["hookEvent"] ?? "nil")")
         let sessionId = msg["sessionId"] as? String ?? UUID().uuidString
         let hookEvent  = msg["hookEvent"] as? String ?? ""
         let cwd        = msg["cwd"] as? String ?? ""

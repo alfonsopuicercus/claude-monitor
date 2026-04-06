@@ -1,19 +1,18 @@
 // DynamicIslandWindow.swift
-// A borderless NSPanel that sits at the top-center of the primary screen,
-// always above other windows, shaped like a pill — the "Dynamic Island" for
-// Claude Monitor.
+// A borderless NSPanel that hugs the very top of the primary screen — exactly
+// like the iPhone Dynamic Island: square top corners, rounded bottom corners,
+// always above other windows.
 
 import AppKit
 import SwiftUI
 
 final class DynamicIslandWindow: NSPanel {
 
-    private let store: SessionStore
-    private var hostingView: NSHostingView<DynamicIslandView>!
-
-    // Sizes
-    static let collapsedSize = CGSize(width: 260, height: 40)
+    static let barHeight: CGFloat   = 42     // collapsed bar height
     static let expandedWidth: CGFloat = 420
+    static var collapsedSize: CGSize { CGSize(width: 310, height: barHeight) }
+
+    private let store: SessionStore
 
     init(store: SessionStore) {
         self.store = store
@@ -24,73 +23,58 @@ final class DynamicIslandWindow: NSPanel {
             defer: false
         )
 
-        // Window properties
-        self.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)))
-        self.backgroundColor = .clear
-        self.isOpaque = false
-        self.hasShadow = false          // we draw our own shadow in SwiftUI
-        self.isMovableByWindowBackground = false
-        self.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
-        self.acceptsMouseMovedEvents = true
+        level           = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.overlayWindow)))
+        backgroundColor = .clear
+        isOpaque        = false
+        hasShadow       = false   // shadow drawn by SwiftUI
+        isMovableByWindowBackground = false
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        acceptsMouseMovedEvents = true
 
-        // SwiftUI content
         let view = DynamicIslandView(store: store, window: self)
-        hostingView = NSHostingView(rootView: view)
-        hostingView.frame = self.contentView?.bounds ?? .zero
-        hostingView.autoresizingMask = [.width, .height]
-        self.contentView = hostingView
+        let hv   = NSHostingView(rootView: view)
+        hv.autoresizingMask = [.width, .height]
+        contentView = hv
 
-        positionAtTopCenter()
-        startObservingScreenChanges()
-    }
+        snapToTop(size: DynamicIslandWindow.collapsedSize, animated: false)
 
-    // MARK: - Sizing
-
-    func resize(to newSize: CGSize, animated: Bool) {
-        guard let screen = NSScreen.main else { return }
-        let screenFrame = screen.frame
-        let x = screenFrame.midX - newSize.width / 2
-        // Pin to top: a bit below the very top edge (notch area)
-        let topOffset: CGFloat = 8
-        let y = screenFrame.maxY - newSize.height - topOffset
-
-        let newFrame = NSRect(x: x, y: y, width: newSize.width, height: newSize.height)
-
-        if animated {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.38
-                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.56, 0.64, 1.0) // spring-like
-                self.animator().setFrame(newFrame, display: true)
-            }
-        } else {
-            self.setFrame(newFrame, display: true)
-        }
-    }
-
-    // MARK: - Positioning
-
-    func positionAtTopCenter() {
-        let size = self.frame.size.width > 0 ? self.frame.size : DynamicIslandWindow.collapsedSize
-        resize(to: size, animated: false)
-    }
-
-    // MARK: - Hit testing: pass clicks through transparent/empty areas
-
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
-
-    // MARK: - Screen changes
-
-    private func startObservingScreenChanges() {
         NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(screenDidChange),
-            name: NSApplication.didChangeScreenParametersNotification,
-            object: nil
+            self, selector: #selector(screenChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil
         )
     }
 
-    @objc private func screenDidChange() {
-        positionAtTopCenter()
+    // MARK: - Public resize API
+
+    func resize(to size: CGSize, animated: Bool) {
+        snapToTop(size: size, animated: animated)
     }
+
+    // MARK: - Private helpers
+
+    private func snapToTop(size: CGSize, animated: Bool) {
+        guard let screen = NSScreen.main else { return }
+        let sr = screen.frame
+        // Pin to the very top center — y puts the TOP of the window at screen.maxY
+        let x = (sr.width - size.width) / 2 + sr.minX
+        let y = sr.maxY - size.height       // flush to top
+        let newFrame = NSRect(x: x, y: y, width: size.width, height: size.height)
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.36
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.5, 0.64, 1.0)
+                animator().setFrame(newFrame, display: true)
+            }
+        } else {
+            setFrame(newFrame, display: false)
+        }
+    }
+
+    @objc private func screenChanged() {
+        snapToTop(size: frame.size, animated: false)
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
 }
