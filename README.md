@@ -2,7 +2,6 @@
 
 An open-source macOS menu bar app that tracks your Claude Code sessions in real time — showing what Claude is doing, which tool it's running, and letting you approve or deny permission requests without switching windows.
 
-Built as an open-source alternative to [Vibe Island](https://vibeisland.app).
 
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue)
 ![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange)

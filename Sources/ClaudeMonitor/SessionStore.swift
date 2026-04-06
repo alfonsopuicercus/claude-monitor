@@ -99,13 +99,15 @@ final class SessionStore: ObservableObject {
     private func loadFromDisk() {
         guard let data = try? Data(contentsOf: kStoragePath),
               let decoded = try? JSONDecoder().decode([ClaudeSession].self, from: data) else { return }
-        // Any session that was waiting for permission in a previous run cannot be
-        // responded to — the bridge process is gone. Clear those to idle.
+        // Sessions from previous runs can't be resumed — reset to idle.
+        // "working" means the old Claude process is gone; "waitingForPermission"
+        // means the bridge fd is gone so we can't respond.
         sessions = decoded.map { s in
             var s = s
-            if s.status == .waitingForPermission {
+            if s.status == .waitingForPermission || s.status == .working {
                 s.status = .idle
                 s.pendingPermission = nil
+                s.currentTool = nil
             }
             return s
         }
@@ -175,19 +177,24 @@ final class SessionStore: ObservableObject {
     // MARK: Permission responses
 
     func approvePermission(sessionId: String) {
-        sendPermissionResponse(sessionId: sessionId, allow: true)
+        sendPermissionResponse(sessionId: sessionId, allow: true, reason: nil)
     }
 
     func denyPermission(sessionId: String) {
-        sendPermissionResponse(sessionId: sessionId, allow: false)
+        sendPermissionResponse(sessionId: sessionId, allow: false, reason: nil)
     }
 
-    private func sendPermissionResponse(sessionId: String, allow: Bool) {
+    /// Approve with a custom instruction injected as a "reason" for Claude to read.
+    func approveWithInstruction(sessionId: String, instruction: String) {
+        sendPermissionResponse(sessionId: sessionId, allow: true, reason: instruction.isEmpty ? nil : instruction)
+    }
+
+    private func sendPermissionResponse(sessionId: String, allow: Bool, reason: String?) {
         // Send to bridge if the connection is still live
         if let fd = pendingPermissionFDs[sessionId] {
-            let resp: [String: Any] = allow
-                ? ["continue": true]
-                : ["continue": false, "reason": "Denied via Claude Monitor"]
+            var resp: [String: Any] = ["continue": allow]
+            if !allow { resp["reason"] = reason ?? "Denied via Claude Monitor" }
+            else if let r = reason, !r.isEmpty { resp["reason"] = r }
             if let data = try? JSONSerialization.data(withJSONObject: resp) {
                 var payload = data
                 payload.append(contentsOf: [UInt8]("\n".utf8))
