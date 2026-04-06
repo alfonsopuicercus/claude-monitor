@@ -8,9 +8,10 @@ extension Notification.Name {
     static let pinnedScreenChanged = Notification.Name("ClaudeMonitorPinnedScreenChanged")
 }
 
-/// Ensures the first mouse-down activates buttons rather than just making the panel key.
+/// Ensures clicks inside the panel are handled immediately, not delayed by key-window promotion.
 final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var acceptsFirstResponder: Bool { true }
 }
 
 final class DynamicIslandWindow: NSPanel {
@@ -50,6 +51,7 @@ final class DynamicIslandWindow: NSPanel {
         let hv   = FirstMouseHostingView(rootView: view)
         hv.autoresizingMask = [.width, .height]
         contentView = hv
+        makeFirstResponder(hv)
 
         snapToTop(size: DynamicIslandWindow.collapsedSize, animated: false)
 
@@ -99,6 +101,12 @@ final class DynamicIslandWindow: NSPanel {
 
     @objc private func screenChanged() {
         snapToTop(size: frame.size, animated: false)
+    }
+
+    // Make the window key on first click so SwiftUI buttons fire immediately
+    override func mouseDown(with event: NSEvent) {
+        if !isKeyWindow { makeKey() }
+        super.mouseDown(with: event)
     }
 
     override var canBecomeKey: Bool { true }

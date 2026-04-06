@@ -844,38 +844,105 @@ private struct StatsCache: Codable {
     var dailyModelTokens: [DailyTokenEntry]?
 }
 
+private struct UsageData {
+    var todayTokens: Int
+    var weekTokens: Int
+    var monthTokens: Int
+    var peakDayTokens: Int   // highest single day in last 30d — used to scale bars
+    var lastDate: String     // most recent date with data
+}
+
 struct TokenStatsView: View {
-    @State private var todayTokens: Int = 0
-    @State private var weekTokens: Int  = 0
+    @State private var usage: UsageData = UsageData(todayTokens: 0, weekTokens: 0, monthTokens: 0, peakDayTokens: 1, lastDate: "")
+
+    private var dailyResetLabel: String {
+        // Claude Pro daily reset is typically midnight UTC
+        let tz = TimeZone.current
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let now = Date()
+        // Next midnight local time
+        guard let tomorrow = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now)) else { return "" }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "h:mm a"
+        fmt.timeZone = tz
+        return "Resets at \(fmt.string(from: tomorrow))"
+    }
+
+    private var weeklyResetLabel: String {
+        let cal = Calendar.current
+        let now = Date()
+        var comps = DateComponents(); comps.weekday = 2  // Monday
+        guard let nextMon = cal.nextDate(after: now, matching: comps, matchingPolicy: .nextTimePreservingSmallerComponents) else { return "" }
+        let fmt = DateFormatter(); fmt.dateFormat = "MMM d"
+        let days = cal.dateComponents([.day], from: cal.startOfDay(for: now), to: cal.startOfDay(for: nextMon)).day ?? 0
+        if days == 0 { return "Resets today" }
+        if days == 1 { return "Resets tomorrow" }
+        return "Resets \(fmt.string(from: nextMon))"
+    }
 
     var body: some View {
-        HStack(spacing: 16) {
-            tokenPill(label: "TODAY", value: todayTokens)
-            tokenPill(label: "30 DAYS", value: weekTokens)
-            Spacer()
+        VStack(alignment: .leading, spacing: 10) {
+            usageRow(
+                label: "TODAY",
+                tokens: usage.todayTokens,
+                peak: usage.peakDayTokens,
+                resetLabel: dailyResetLabel
+            )
+            usageRow(
+                label: "THIS WEEK",
+                tokens: usage.weekTokens,
+                peak: max(usage.monthTokens, 1),
+                resetLabel: weeklyResetLabel
+            )
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .padding(.vertical, 10)
         .onAppear { reload() }
     }
 
-    private func tokenPill(label: String, value: Int) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label)
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
-                .tracking(1)
-                .foregroundColor(.white.opacity(0.28))
-            Text(formatTokens(value))
-                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                .foregroundColor(.white.opacity(value > 0 ? 0.8 : 0.18))
+    private func usageRow(label: String, tokens: Int, peak: Int, resetLabel: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label)
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .tracking(1.5)
+                    .foregroundColor(.white.opacity(0.45))
+                Spacer()
+                Text(formatTokens(tokens))
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundColor(tokens > 0 ? barColor(ratio: Double(tokens) / Double(max(peak, 1))) : .white.opacity(0.2))
+            }
+            // Progress bar
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(Color.white.opacity(0.07))
+                    let ratio = min(Double(tokens) / Double(max(peak, 1)), 1.0)
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(barColor(ratio: ratio).opacity(0.8))
+                        .frame(width: max(geo.size.width * ratio, tokens > 0 ? 4 : 0))
+                }
+            }
+            .frame(height: 5)
+
+            Text(tokens > 0 ? resetLabel : "No usage recorded")
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(.white.opacity(0.22))
         }
+    }
+
+    private func barColor(ratio: Double) -> Color {
+        if ratio < 0.5 { return Color(red: 0.3, green: 0.85, blue: 0.45) }
+        if ratio < 0.8 { return Color(red: 1.0, green: 0.75, blue: 0.2) }
+        return Color(red: 1.0, green: 0.35, blue: 0.25)
     }
 
     private func formatTokens(_ n: Int) -> String {
         if n == 0 { return "—" }
-        if n < 1_000 { return "\(n)" }
-        if n < 1_000_000 { return String(format: "%.1fk", Double(n) / 1_000) }
-        return String(format: "%.2fM", Double(n) / 1_000_000)
+        if n < 1_000 { return "\(n) tok" }
+        if n < 1_000_000 { return String(format: "%.1fk tok", Double(n) / 1_000) }
+        return String(format: "%.2fM tok", Double(n) / 1_000_000)
     }
 
     private func reload() {
@@ -889,14 +956,30 @@ struct TokenStatsView: View {
         let today = fmt.string(from: Date())
         let thirtyDaysAgo = fmt.string(from: Date().addingTimeInterval(-29 * 86400))
 
-        var tTotal = 0; var wTotal = 0
+        // Start of current Mon–Sun week
+        var cal = Calendar(identifier: .gregorian); cal.firstWeekday = 2
+        let weekStart = cal.date(from: cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date()))!
+        let weekStartStr = fmt.string(from: weekStart)
+
+        var todayTok = 0, weekTok = 0, monthTok = 0, peakDay = 0
+        var lastDate = ""
         for entry in entries {
             let sum = entry.tokensByModel.values.reduce(0, +)
-            if entry.date == today { tTotal += sum }
-            if entry.date >= thirtyDaysAgo { wTotal += sum }
+            if entry.date == today { todayTok = sum }
+            if entry.date >= weekStartStr { weekTok += sum }
+            if entry.date >= thirtyDaysAgo {
+                monthTok += sum
+                if sum > peakDay { peakDay = sum }
+                if entry.date > lastDate { lastDate = entry.date }
+            }
         }
-        todayTokens = tTotal
-        weekTokens  = wTotal
+        usage = UsageData(
+            todayTokens: todayTok,
+            weekTokens: weekTok,
+            monthTokens: monthTok,
+            peakDayTokens: max(peakDay, 1),
+            lastDate: lastDate
+        )
     }
 }
 
