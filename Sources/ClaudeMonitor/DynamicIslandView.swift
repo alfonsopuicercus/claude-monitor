@@ -474,6 +474,7 @@ struct SessionCard: View {
     let session: ClaudeSession
     @ObservedObject var store: SessionStore
     @State private var showInput = false
+    @State private var ctxPct: Int = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -490,11 +491,16 @@ struct SessionCard: View {
 
                 if let tool = session.currentTool { MiniToolBadge(name: tool) }
                 Spacer()
+                if ctxPct > 0 {
+                    ContextPctBadge(pct: ctxPct)
+                }
                 Text(timeAgo(session.lastActivityAt))
                     .font(.system(size: 10))
                     .foregroundColor(.white.opacity(0.22))
             }
             .padding(.bottom, 5)
+            .onAppear { reloadCtx() }
+            .onChange(of: session.lastActivityAt) { _ in reloadCtx() }
 
             // Last user prompt
             if let msg = session.lastUserMessage {
@@ -569,6 +575,57 @@ struct SessionCard: View {
             return val.components(separatedBy: .newlines).first.map { "▶ " + $0 } ?? raw
         }
         return "▶ " + (raw.components(separatedBy: .newlines).first ?? raw)
+    }
+
+    private func reloadCtx() {
+        let cwd = session.cwd
+        DispatchQueue.global(qos: .utility).async {
+            let pct = Self.computeContextPct(cwd: cwd)
+            DispatchQueue.main.async { ctxPct = pct }
+        }
+    }
+
+    /// Reads the most-recently-modified JSONL for this session's cwd and
+    /// returns context window usage as a percent of the 200 K token limit.
+    /// All token types (input, cache_creation, cache_read, output) count.
+    private static func computeContextPct(cwd: String) -> Int {
+        let fm = FileManager.default
+        // Encoding: every "/" → "-"  (leading "/" becomes leading "-")
+        let encoded = cwd.replacingOccurrences(of: "/", with: "-")
+        let dir = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/projects/\(encoded)")
+
+        guard let files = try? fm.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return 0 }
+
+        // Most recently modified JSONL = the live conversation
+        let jsonls = files.filter { $0.pathExtension == "jsonl" }
+        guard let latest = jsonls.max(by: {
+            let d0 = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let d1 = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return d0 < d1
+        }) else { return 0 }
+
+        guard let content = try? String(contentsOf: latest, encoding: .utf8) else { return 0 }
+
+        // Find the last assistant message's usage — that's the most recent context size
+        var lastUsage: [String: Any]?
+        for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let msg = obj["message"] as? [String: Any],
+                  msg["role"] as? String == "assistant",
+                  let usage = msg["usage"] as? [String: Any] else { continue }
+            lastUsage = usage
+        }
+        guard let u = lastUsage else { return 0 }
+
+        // All token types count toward the context window
+        let total = (u["input_tokens"] as? Int ?? 0)
+                  + (u["cache_creation_input_tokens"] as? Int ?? 0)
+                  + (u["cache_read_input_tokens"] as? Int ?? 0)
+                  + (u["output_tokens"] as? Int ?? 0)
+        return min(100, Int(Double(total) / 200_000.0 * 100))
     }
 }
 
@@ -834,151 +891,127 @@ struct MiniToolBadge: View {
     }
 }
 
-// MARK: - Token usage
+// MARK: - Context % badge
 
-private struct DailyTokenEntry: Codable {
-    var date: String
-    var tokensByModel: [String: Int]
+struct ContextPctBadge: View {
+    let pct: Int
+
+    private var color: Color {
+        if pct >= 90 { return Color(red: 1.0, green: 0.25, blue: 0.25) }
+        if pct >= 75 { return Color(red: 1.0, green: 0.55, blue: 0.15) }
+        if pct >= 50 { return Color(red: 1.0, green: 0.85, blue: 0.20) }
+        return .white.opacity(0.32)
+    }
+
+    var body: some View {
+        HStack(spacing: 3) {
+            // Mini progress bar (24 pt wide, 3 pt tall)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(Color.white.opacity(0.1))
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(color.opacity(0.7))
+                        .frame(width: geo.size.width * CGFloat(pct) / 100)
+                }
+            }
+            .frame(width: 24, height: 3)
+
+            Text("\(pct)%")
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundColor(color)
+        }
+    }
 }
-private struct StatsCache: Codable {
-    var dailyModelTokens: [DailyTokenEntry]?
-}
+
+// MARK: - Token usage
 
 private struct UsageData {
     var todayTokens: Int
     var weekTokens: Int
-    var monthTokens: Int
-    var peakDayTokens: Int   // highest single day in last 30d — used to scale bars
-    var lastDate: String     // most recent date with data
 }
 
 struct TokenStatsView: View {
-    @State private var usage: UsageData = UsageData(todayTokens: 0, weekTokens: 0, monthTokens: 0, peakDayTokens: 1, lastDate: "")
-
-    private var dailyResetLabel: String {
-        // Claude Pro daily reset is typically midnight UTC
-        let tz = TimeZone.current
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = tz
-        let now = Date()
-        // Next midnight local time
-        guard let tomorrow = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: now)) else { return "" }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "h:mm a"
-        fmt.timeZone = tz
-        return "Resets at \(fmt.string(from: tomorrow))"
-    }
-
-    private var weeklyResetLabel: String {
-        let cal = Calendar.current
-        let now = Date()
-        var comps = DateComponents(); comps.weekday = 2  // Monday
-        guard let nextMon = cal.nextDate(after: now, matching: comps, matchingPolicy: .nextTimePreservingSmallerComponents) else { return "" }
-        let fmt = DateFormatter(); fmt.dateFormat = "MMM d"
-        let days = cal.dateComponents([.day], from: cal.startOfDay(for: now), to: cal.startOfDay(for: nextMon)).day ?? 0
-        if days == 0 { return "Resets today" }
-        if days == 1 { return "Resets tomorrow" }
-        return "Resets \(fmt.string(from: nextMon))"
-    }
+    @State private var usage: UsageData = UsageData(todayTokens: 0, weekTokens: 0)
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            usageRow(
-                label: "TODAY",
-                tokens: usage.todayTokens,
-                peak: usage.peakDayTokens,
-                resetLabel: dailyResetLabel
-            )
-            usageRow(
-                label: "THIS WEEK",
-                tokens: usage.weekTokens,
-                peak: max(usage.monthTokens, 1),
-                resetLabel: weeklyResetLabel
-            )
+        HStack(spacing: 0) {
+            if usage.todayTokens > 0 || usage.weekTokens > 0 {
+                Group {
+                    Text("today ").foregroundColor(.white.opacity(0.22))
+                    + Text(formatTok(usage.todayTokens)).foregroundColor(.white.opacity(0.45))
+                    + Text("  wk ").foregroundColor(.white.opacity(0.22))
+                    + Text(formatTok(usage.weekTokens)).foregroundColor(.white.opacity(0.45))
+                }
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+            } else {
+                Text("no usage data")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.18))
+            }
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.vertical, 4)
         .onAppear { reload() }
     }
 
-    private func usageRow(label: String, tokens: Int, peak: Int, resetLabel: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(label)
-                    .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .tracking(1.5)
-                    .foregroundColor(.white.opacity(0.45))
-                Spacer()
-                Text(formatTokens(tokens))
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundColor(tokens > 0 ? barColor(ratio: Double(tokens) / Double(max(peak, 1))) : .white.opacity(0.2))
-            }
-            // Progress bar
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(Color.white.opacity(0.07))
-                    let ratio = min(Double(tokens) / Double(max(peak, 1)), 1.0)
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(barColor(ratio: ratio).opacity(0.8))
-                        .frame(width: max(geo.size.width * ratio, tokens > 0 ? 4 : 0))
-                }
-            }
-            .frame(height: 5)
-
-            Text(tokens > 0 ? resetLabel : "No usage recorded")
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundColor(.white.opacity(0.22))
-        }
-    }
-
-    private func barColor(ratio: Double) -> Color {
-        if ratio < 0.5 { return Color(red: 0.3, green: 0.85, blue: 0.45) }
-        if ratio < 0.8 { return Color(red: 1.0, green: 0.75, blue: 0.2) }
-        return Color(red: 1.0, green: 0.35, blue: 0.25)
-    }
-
-    private func formatTokens(_ n: Int) -> String {
-        if n == 0 { return "—" }
-        if n < 1_000 { return "\(n) tok" }
-        if n < 1_000_000 { return String(format: "%.1fk tok", Double(n) / 1_000) }
-        return String(format: "%.2fM tok", Double(n) / 1_000_000)
+    private func formatTok(_ n: Int) -> String {
+        if n < 1_000 { return "\(n)" }
+        if n < 1_000_000 { return String(format: "%.0fk", Double(n) / 1_000) }
+        return String(format: "%.1fM", Double(n) / 1_000_000)
     }
 
     private func reload() {
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/stats-cache.json")
-        guard let data = try? Data(contentsOf: path),
-              let cache = try? JSONDecoder().decode(StatsCache.self, from: data),
-              let entries = cache.dailyModelTokens else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let result = Self.computeUsage()
+            DispatchQueue.main.async { self.usage = result }
+        }
+    }
 
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"; fmt.locale = Locale(identifier: "en_US_POSIX")
-        let today = fmt.string(from: Date())
-        let thirtyDaysAgo = fmt.string(from: Date().addingTimeInterval(-29 * 86400))
-
-        // Start of current Mon–Sun week
+    private static func computeUsage() -> UsageData {
+        let fm = FileManager.default
+        let projectsDir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let dateFmt = DateFormatter()
+        dateFmt.dateFormat = "yyyy-MM-dd"
+        dateFmt.locale = Locale(identifier: "en_US_POSIX")
+        let today = dateFmt.string(from: Date())
         var cal = Calendar(identifier: .gregorian); cal.firstWeekday = 2
-        let weekStart = cal.date(from: cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date()))!
-        let weekStartStr = fmt.string(from: weekStart)
+        let weekStart = cal.date(from: cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: Date())) ?? Date()
+        let weekStartStr = dateFmt.string(from: weekStart)
 
-        var todayTok = 0, weekTok = 0, monthTok = 0, peakDay = 0
-        var lastDate = ""
-        for entry in entries {
-            let sum = entry.tokensByModel.values.reduce(0, +)
-            if entry.date == today { todayTok = sum }
-            if entry.date >= weekStartStr { weekTok += sum }
-            if entry.date >= thirtyDaysAgo {
-                monthTok += sum
-                if sum > peakDay { peakDay = sum }
-                if entry.date > lastDate { lastDate = entry.date }
+        var dailyTotals: [String: Int] = [:]
+        guard let projectDirs = try? fm.contentsOfDirectory(at: projectsDir, includingPropertiesForKeys: nil) else {
+            return UsageData(todayTokens: 0, weekTokens: 0)
+        }
+        for dir in projectDirs {
+            guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for file in files where file.pathExtension == "jsonl" {
+                // Skip files older than this week
+                if let attrs = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
+                   let mod = attrs.contentModificationDate,
+                   dateFmt.string(from: mod) < weekStartStr { continue }
+                guard let content = try? String(contentsOf: file, encoding: .utf8) else { continue }
+                for line in content.split(separator: "\n", omittingEmptySubsequences: true) {
+                    guard let data = line.data(using: .utf8),
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let ts = obj["timestamp"] as? String,
+                          let msg = obj["message"] as? [String: Any],
+                          msg["role"] as? String == "assistant",
+                          let u = msg["usage"] as? [String: Any] else { continue }
+                    let dateStr = String(ts.prefix(10))
+                    guard dateStr >= weekStartStr else { continue }
+                    // Count new tokens only; skip cache_read (reused context, ~10x cheaper)
+                    let tok = (u["input_tokens"] as? Int ?? 0)
+                            + (u["output_tokens"] as? Int ?? 0)
+                            + (u["cache_creation_input_tokens"] as? Int ?? 0)
+                    dailyTotals[dateStr, default: 0] += tok
+                }
             }
         }
-        usage = UsageData(
-            todayTokens: todayTok,
-            weekTokens: weekTok,
-            monthTokens: monthTok,
-            peakDayTokens: max(peakDay, 1),
-            lastDate: lastDate
+        return UsageData(
+            todayTokens: dailyTotals[today] ?? 0,
+            weekTokens: dailyTotals.filter { $0.key >= weekStartStr }.values.reduce(0, +)
         )
     }
 }

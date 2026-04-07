@@ -168,15 +168,19 @@ final class SessionStore: ObservableObject {
     private func pruneDeadSessions() {
         let idleCutoff = Date().addingTimeInterval(-300)         // 5 min idle → remove
         let permCutoff = Date().addingTimeInterval(-3600)        // 1 h stale permission → remove
-        sessions.removeAll {
-            if $0.status == .idle && $0.lastActivityAt < idleCutoff { return true }
-            // Stale permission request with no live bridge fd → remove
-            if $0.status == .waitingForPermission,
-               let receivedAt = $0.pendingPermission?.receivedAt,
-               receivedAt < permCutoff,
-               pendingPermissionFDs[$0.id] == nil { return true }
-            return false
+        var toRemove: [String] = []
+        for s in sessions {
+            if s.status == .idle && s.lastActivityAt < idleCutoff {
+                toRemove.append(s.id)
+            } else if s.status == .waitingForPermission,
+                      let receivedAt = s.pendingPermission?.receivedAt,
+                      receivedAt < permCutoff {
+                // Deny any live bridge fd before removing, so the waiting claude process exits
+                sendPermissionResponse(sessionId: s.id, allow: false, reason: "Session expired — denied by Claude Monitor")
+                toRemove.append(s.id)
+            }
         }
+        sessions.removeAll { toRemove.contains($0.id) }
         recalcPermissions()
         saveToDisk()
         NotificationCenter.default.post(name: .storeDidUpdate, object: nil)
@@ -206,6 +210,9 @@ final class SessionStore: ObservableObject {
             if let data = try? JSONSerialization.data(withJSONObject: resp) {
                 var payload = data
                 payload.append(contentsOf: [UInt8]("\n".utf8))
+                // SO_NOSIGPIPE prevents SIGPIPE if the other end already closed
+                var nosig: Int32 = 1
+                setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosig, socklen_t(MemoryLayout<Int32>.size))
                 payload.withUnsafeBytes { send(fd, $0.baseAddress!, $0.count, 0) }
             }
             close(fd)

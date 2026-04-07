@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Ignore SIGPIPE so writing to a closed socket returns EPIPE instead of crashing
+        signal(SIGPIPE, SIG_IGN)
+
         NSApp.setActivationPolicy(.accessory)
 
         store = SessionStore()
@@ -20,6 +23,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Dynamic Island overlay
         islandWindow = DynamicIslandWindow(store: store)
         islandWindow.makeKeyAndOrderFront(nil)
+        // Re-snap after the run loop settles so the window lands on the pinned screen,
+        // not whichever screen AppKit chose at init time.
+        DispatchQueue.main.async { self.islandWindow.snapToPreferredScreen() }
 
         // Tiny menu bar icon (just for quitting gracefully)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)

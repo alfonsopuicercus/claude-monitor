@@ -16,7 +16,7 @@ final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
 
 final class DynamicIslandWindow: NSPanel {
 
-    static let barHeight: CGFloat    = 42
+    static var barHeight: CGFloat    { NSStatusBar.system.thickness }
     static let expandedWidth: CGFloat = 420
     static var collapsedSize: CGSize { CGSize(width: 310, height: barHeight) }
 
@@ -71,6 +71,12 @@ final class DynamicIslandWindow: NSPanel {
         snapToTop(size: size, animated: animated)
     }
 
+    /// Re-snap to the pinned screen. Call after the window has been ordered front
+    /// so the window system has settled and screen association is correct.
+    func snapToPreferredScreen() {
+        snapToTop(size: frame.size, animated: false)
+    }
+
     // MARK: - Private helpers
 
     /// The screen to pin to: the stored preference, falling back to the primary display.
@@ -103,10 +109,12 @@ final class DynamicIslandWindow: NSPanel {
         snapToTop(size: frame.size, animated: false)
     }
 
-    // Make the window key on first click so SwiftUI buttons fire immediately
-    override func mouseDown(with event: NSEvent) {
-        if !isKeyWindow { makeKey() }
-        super.mouseDown(with: event)
+    // Make the window key before ANY left-click so the full event chain
+    // (mouseDown → mouseUp) is processed while the panel is key, which is
+    // required for SwiftUI Button actions to fire in a non-activating NSPanel.
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown && !isKeyWindow { makeKey() }
+        super.sendEvent(event)
     }
 
     override var canBecomeKey: Bool { true }
